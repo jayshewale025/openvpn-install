@@ -437,9 +437,10 @@ server=$dns_ip"
 	esac
 	# Setup dnsmasq with selected upstream DNS
 	setup_dnsmasq "$upstream_dns"
-	# Push VPN server as DNS with private domain (split DNS)
+	# Push VPN server as DNS with DOMAIN-ROUTE so only .vpn queries use VPN DNS
+	# DOMAIN-ROUTE tells clients to route only this domain to the VPN DNS (split DNS)
 	echo "push \"dhcp-option DNS ${VPN_SUBNET}.1\"" >> /etc/openvpn/server/server.conf
-	echo "push \"dhcp-option DOMAIN ${VPN_DOMAIN}\"" >> /etc/openvpn/server/server.conf
+	echo "push \"dhcp-option DOMAIN-ROUTE ${VPN_DOMAIN}\"" >> /etc/openvpn/server/server.conf
 	echo "keepalive 10 120
 user nobody
 group $group_name
@@ -535,6 +536,7 @@ persist-key
 persist-tun
 remote-cert-tls server
 auth SHA512
+pull-filter ignore redirect-gateway
 verb 3" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
