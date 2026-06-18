@@ -83,6 +83,95 @@ fi
 # Store the absolute path of the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# --- VPN Private DNS Configuration ---
+DNSMASQ_VPN_CONF="/etc/dnsmasq.d/openvpn-vpn.conf"
+CCD_DIR="/etc/openvpn/server/ccd"
+VPN_DOMAIN="vpn"
+VPN_SUBNET="10.8.0"
+
+get_next_vpn_ip() {
+	# Server is .1, clients start from .2
+	for i in $(seq 2 254); do
+		if [ -d "$CCD_DIR" ]; then
+			if grep -rq "ifconfig-push ${VPN_SUBNET}\.${i} " "$CCD_DIR"/ 2>/dev/null; then
+				continue
+			fi
+		fi
+		echo "${VPN_SUBNET}.${i}"
+		return
+	done
+	echo "Error: No available VPN IP addresses." >&2
+	exit 1
+}
+
+add_dns_entry() {
+	local client_name="$1"
+	local client_ip
+	client_ip=$(get_next_vpn_ip)
+	# Create CCD directory if needed
+	mkdir -p "$CCD_DIR"
+	# Assign static IP via CCD
+	echo "ifconfig-push $client_ip 255.255.255.0" > "$CCD_DIR/$client_name"
+	# Add DNS entry to dnsmasq
+	if [ -f "$DNSMASQ_VPN_CONF" ]; then
+		echo "address=/${client_name}.${VPN_DOMAIN}/${client_ip}" >> "$DNSMASQ_VPN_CONF"
+		systemctl restart dnsmasq.service >/dev/null 2>&1
+	fi
+	echo "  DNS hostname: ${client_name}.${VPN_DOMAIN} -> ${client_ip}"
+}
+
+remove_dns_entry() {
+	local client_name="$1"
+	# Remove CCD file
+	rm -f "$CCD_DIR/$client_name"
+	# Remove DNS entry from dnsmasq
+	if [ -f "$DNSMASQ_VPN_CONF" ]; then
+		sed -i "/address=\/${client_name}\.${VPN_DOMAIN}\//d" "$DNSMASQ_VPN_CONF"
+		systemctl restart dnsmasq.service >/dev/null 2>&1
+	fi
+}
+
+setup_dnsmasq() {
+	local upstream_dns="$1"
+	mkdir -p /etc/dnsmasq.d
+	# Ensure dnsmasq includes conf-dir (most distros do by default)
+	if ! grep -qs "^conf-dir=/etc/dnsmasq.d" /etc/dnsmasq.conf 2>/dev/null; then
+		echo "conf-dir=/etc/dnsmasq.d/,*.conf" >> /etc/dnsmasq.conf
+	fi
+	cat > "$DNSMASQ_VPN_CONF" <<DNSEOF
+# OpenVPN private DNS configuration
+# Listen only on VPN tunnel interface and localhost
+interface=tun0
+bind-dynamic
+
+# Don't read /etc/resolv.conf for upstream (we define our own)
+no-resolv
+
+# Domain for VPN clients
+domain=${VPN_DOMAIN}
+local=/${VPN_DOMAIN}/
+
+# Upstream DNS servers (for forwarding non-VPN queries)
+${upstream_dns}
+
+# VPN server itself
+address=/server.${VPN_DOMAIN}/${VPN_SUBNET}.1
+
+# --- CLIENT DNS ENTRIES ---
+DNSEOF
+	systemctl enable dnsmasq.service >/dev/null 2>&1
+	# dnsmasq will be started after OpenVPN creates tun0
+}
+
+cleanup_dnsmasq() {
+	rm -f "$DNSMASQ_VPN_CONF"
+	rm -rf "$CCD_DIR"
+	if systemctl is-active --quiet dnsmasq.service; then
+		systemctl restart dnsmasq.service >/dev/null 2>&1
+	fi
+}
+# --- End VPN Private DNS ---
+
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -167,7 +256,7 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	done
 	[[ -z "$port" ]] && port="1194"
 	echo
-	echo "Select a DNS server for the clients:"
+	echo "Select an upstream DNS server (used by dnsmasq for non-VPN queries):"
 	echo "   1) Default system resolvers"
 	echo "   2) Google"
 	echo "   3) 1.1.1.1"
@@ -233,13 +322,13 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 		apt-get update
-		apt-get install -y --no-install-recommends openvpn openssl ca-certificates $firewall
+		apt-get install -y --no-install-recommends openvpn openssl ca-certificates dnsmasq $firewall
 	elif [[ "$os" = "centos" ]]; then
 		dnf install -y epel-release
-		dnf install -y openvpn openssl ca-certificates tar $firewall
+		dnf install -y openvpn openssl ca-certificates tar dnsmasq $firewall
 	else
 		# Else, OS must be Fedora
-		dnf install -y openvpn openssl ca-certificates tar $firewall
+		dnf install -y openvpn openssl ca-certificates tar dnsmasq $firewall
 	fi
 	# If firewalld was just installed, enable it
 	if [[ "$firewall" == "firewalld" ]]; then
@@ -291,14 +380,15 @@ tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 	# IPv6
-	if [[ -z "$ip6" ]]; then
-		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
-	else
+	if [[ -n "$ip6" ]]; then
 		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
-		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
 	fi
+	# Split tunnel: only VPN subnet traffic goes through tunnel (no redirect-gateway)
+	# CCD for static IP assignment (required for private DNS entries)
+	echo 'client-config-dir ccd' >> /etc/openvpn/server/server.conf
 	echo 'ifconfig-pool-persist ipp.txt' >> /etc/openvpn/server/server.conf
-	# DNS
+	# DNS - Build upstream DNS for dnsmasq, push VPN server as client DNS
+	upstream_dns=""
 	case "$dns" in
 		1|"")
 			# Locate the proper resolv.conf
@@ -308,42 +398,48 @@ server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 			else
 				resolv_conf="/run/systemd/resolve/resolv.conf"
 			fi
-			# Obtain the resolvers from resolv.conf and use them for OpenVPN
-			grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -v '127.0.0.53' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | while read line; do
-				echo "push \"dhcp-option DNS $line\"" >> /etc/openvpn/server/server.conf
-			done
+			upstream_dns=$(grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -v '127.0.0.53' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | while read line; do echo "server=$line"; done)
 		;;
 		2)
-			echo 'push "dhcp-option DNS 8.8.8.8"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 8.8.4.4"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=8.8.8.8
+server=8.8.4.4"
 		;;
 		3)
-			echo 'push "dhcp-option DNS 1.1.1.1"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 1.0.0.1"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=1.1.1.1
+server=1.0.0.1"
 		;;
 		4)
-			echo 'push "dhcp-option DNS 208.67.222.222"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 208.67.220.220"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=208.67.222.222
+server=208.67.220.220"
 		;;
 		5)
-			echo 'push "dhcp-option DNS 9.9.9.9"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 149.112.112.112"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=9.9.9.9
+server=149.112.112.112"
 		;;
 		6)
-			echo 'push "dhcp-option DNS 95.85.95.85"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2.56.220.2"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=95.85.95.85
+server=2.56.220.2"
 		;;
 		7)
-			echo 'push "dhcp-option DNS 94.140.14.14"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 94.140.15.15"' >> /etc/openvpn/server/server.conf
+			upstream_dns="server=94.140.14.14
+server=94.140.15.15"
 		;;
 		8)
-		for dns_ip in $custom_dns; do
-			echo "push \"dhcp-option DNS $dns_ip\"" >> /etc/openvpn/server/server.conf
-		done
+			for dns_ip in $custom_dns; do
+				if [ -z "$upstream_dns" ]; then
+					upstream_dns="server=$dns_ip"
+				else
+					upstream_dns="${upstream_dns}
+server=$dns_ip"
+				fi
+			done
 		;;
 	esac
-	echo 'push "block-outside-dns"' >> /etc/openvpn/server/server.conf
+	# Setup dnsmasq with selected upstream DNS
+	setup_dnsmasq "$upstream_dns"
+	# Push VPN server as DNS with private domain (split DNS)
+	echo "push \"dhcp-option DNS ${VPN_SUBNET}.1\"" >> /etc/openvpn/server/server.conf
+	echo "push \"dhcp-option DOMAIN ${VPN_DOMAIN}\"" >> /etc/openvpn/server/server.conf
 	echo "keepalive 10 120
 user nobody
 group $group_name
@@ -439,17 +535,23 @@ persist-key
 persist-tun
 remote-cert-tls server
 auth SHA512
-ignore-unknown-option block-outside-dns
 verb 3" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
+	# Start dnsmasq now that OpenVPN has created tun0
+	systemctl restart dnsmasq.service
+	# Add DNS entry for first client
+	add_dns_entry "$client"
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 	echo
 	echo "Finished!"
 	echo
 	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
+	echo "Private DNS domain: .${VPN_DOMAIN}"
+	echo "  Server: server.${VPN_DOMAIN} -> ${VPN_SUBNET}.1"
 	echo "New clients can be added by running this script again."
+	echo "Each client gets a DNS name: <clientname>.${VPN_DOMAIN}"
 else
 	clear
 	echo "OpenVPN is already installed."
@@ -477,6 +579,8 @@ else
 			done
 			cd /etc/openvpn/server/easy-rsa/
 			./easyrsa --batch --days=3650 build-client-full "$client" nopass
+			# Add DNS entry for new client
+			add_dns_entry "$client"
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 			echo
@@ -517,6 +621,8 @@ else
 				cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
 				# CRL is read with each client connection, when OpenVPN is dropped to nobody
 				chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+				# Remove DNS entry and static IP assignment
+				remove_dns_entry "$client"
 				echo
 				echo "$client revoked!"
 			else
@@ -535,6 +641,8 @@ else
 			if [[ "$remove" =~ ^[yY]$ ]]; then
 				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+				# Clean up dnsmasq VPN config
+				cleanup_dnsmasq
 				if systemctl is-active --quiet firewalld.service; then
 					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
